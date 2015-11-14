@@ -4,6 +4,7 @@ local socketchannel = require "socketchannel"
 
 local table = table
 local string = string
+local assert = assert
 
 local redis = {}
 local command = {}
@@ -83,6 +84,7 @@ function redis.connect(db_conf)
 		host = db_conf.host,
 		port = db_conf.port or 6379,
 		auth = redis_login(db_conf.auth, db_conf.db),
+		nodelay = true,
 	}
 	-- try connect first only once
 	channel:connect(true)
@@ -94,31 +96,68 @@ function command:disconnect()
 	setmetatable(self, nil)
 end
 
-local function compose_message(msg)
-	if #msg == 1 then
-		return msg[1] .. "\r\n"
-	end
-	local lines = { "*" .. #msg }
-	for _,v in ipairs(msg) do
-		local t = type(v)
-		if t == "number" then
-			v = tostring(v)
-		elseif t == "userdata" then
-			v = int64.tostring(int64.new(v),10)
-		end
-		table.insert(lines,"$"..#v)
-		table.insert(lines,v)
-	end
-	table.insert(lines,"")
+-- msg could be any type of value
 
-	local cmd =  table.concat(lines,"\r\n")
-	return cmd
+local function make_cache(f)
+	return setmetatable({}, {
+		__mode = "kv",
+		__index = f,
+	})
+end
+
+local header_cache = make_cache(function(t,k)
+		local s = "\r\n$" .. k .. "\r\n"
+		t[k] = s
+		return s
+	end)
+
+local command_cache = make_cache(function(t,cmd)
+		local s = "\r\n$"..#cmd.."\r\n"..cmd:upper()
+		t[cmd] = s
+		return s
+	end)
+
+local count_cache = make_cache(function(t,k)
+		local s = "*" .. k
+		t[k] = s
+		return s
+	end)
+
+local function compose_message(cmd, msg)
+	local t = type(msg)
+	local lines = {}
+
+	if t == "table" then
+		lines[1] = count_cache[#msg+1]
+		lines[2] = command_cache[cmd]
+		local idx = 3
+		for _,v in ipairs(msg) do
+			v= tostring(v)
+			lines[idx] = header_cache[#v]
+			lines[idx+1] = v
+			idx = idx + 2
+		end
+		lines[idx] = "\r\n"
+	else
+		msg = tostring(msg)
+		lines[1] = "*2"
+		lines[2] = command_cache[cmd]
+		lines[3] = header_cache[#msg]
+		lines[4] = msg
+		lines[5] = "\r\n"
+	end
+
+	return lines
 end
 
 setmetatable(command, { __index = function(t,k)
 	local cmd = string.upper(k)
-	local f = function (self, ...)
-		return self[1]:request(compose_message { cmd, ... }, read_response)
+	local f = function (self, v, ...)
+		if type(v) == "table" then
+			return self[1]:request(compose_message(cmd, v), read_response)
+		else
+			return self[1]:request(compose_message(cmd, {v, ...}), read_response)
+		end
 	end
 	t[k] = f
 	return f
@@ -131,12 +170,54 @@ end
 
 function command:exists(key)
 	local fd = self[1]
-	return fd:request(compose_message { "EXISTS", key }, read_boolean)
+	return fd:request(compose_message ("EXISTS", key), read_boolean)
 end
 
 function command:sismember(key, value)
 	local fd = self[1]
-	return fd:request(compose_message { "SISMEMBER", key, value }, read_boolean)
+	return fd:request(compose_message ("SISMEMBER", {key, value}), read_boolean)
+end
+
+local function compose_table(lines, msg)
+	local tinsert = table.insert
+	tinsert(lines, count_cache[#msg])
+	for _,v in ipairs(msg) do
+		v = tostring(v)
+		tinsert(lines,header_cache[#v])
+		tinsert(lines,v)
+	end
+	tinsert(lines, "\r\n")
+	return lines
+end
+
+function command:pipeline(ops,resp)
+	assert(ops and #ops > 0, "pipeline is null")
+
+	local fd = self[1]
+
+	local cmds = {}
+	for _, cmd in ipairs(ops) do
+		compose_table(cmds, cmd)
+	end
+
+	if resp then
+		return fd:request(cmds, function (fd)
+			for i=1, #ops do
+				local ok, out = read_response(fd)
+				table.insert(resp, {ok = ok, out = out})
+			end
+			return true, resp
+		end)
+	else
+		return fd:request(cmds, function (fd)
+			local ok, out
+			for i=1, #ops do
+				ok, out = read_response(fd)
+			end
+			-- return last response
+			return ok,out
+		end)
+	end
 end
 
 --- watch mode
@@ -156,10 +237,10 @@ local function watch_login(obj, auth)
 			so:request("AUTH "..auth.."\r\n", read_response)
 		end
 		for k in pairs(obj.__psubscribe) do
-			so:request(compose_message { "PSUBSCRIBE", k })
+			so:request(compose_message ("PSUBSCRIBE", k))
 		end
 		for k in pairs(obj.__subscribe) do
-			so:request(compose_message { "SUBSCRIBE", k })
+			so:request(compose_message("SUBSCRIBE", k))
 		end
 	end
 end
@@ -173,6 +254,7 @@ function redis.watch(db_conf)
 		host = db_conf.host,
 		port = db_conf.port or 6379,
 		auth = watch_login(obj, db_conf.auth),
+		nodelay = true,
 	}
 	obj.__sock = channel
 
@@ -192,7 +274,7 @@ local function watch_func( name )
 		local so = self.__sock
 		for i = 1, select("#", ...) do
 			local v = select(i, ...)
-			so:request(compose_message { NAME, v })
+			so:request(compose_message(NAME, v))
 		end
 	end
 end

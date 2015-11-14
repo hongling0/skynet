@@ -1,5 +1,6 @@
 local skynet = require "skynet"
 local socket = require "socket"
+local socketdriver = require "socketdriver"
 
 -- channel support auto reconnect , and capture socket error in request/response transaction
 -- { host = "", port = , auth = function(so) , response = function(so) session, data }
@@ -26,6 +27,7 @@ function socket_channel.channel(desc)
 	local c = {
 		__host = assert(desc.host),
 		__port = assert(desc.port),
+		__backup = desc.backup,
 		__auth = desc.auth,
 		__response = desc.response,	-- It's for session mode
 		__request = {},	-- request seq { response func or session }	-- It's for order mode
@@ -36,6 +38,7 @@ function socket_channel.channel(desc)
 		__sock = false,
 		__closed = false,
 		__authcoroutine = false,
+		__nodelay = desc.nodelay,
 	}
 
 	return setmetatable(c, channel_meta)
@@ -78,15 +81,27 @@ local function dispatch_by_session(self)
 	local response = self.__response
 	-- response() return session
 	while self.__sock do
-		local ok , session, result_ok, result_data = pcall(response, self.__sock)
+		local ok , session, result_ok, result_data, padding = pcall(response, self.__sock)
 		if ok and session then
 			local co = self.__thread[session]
-			self.__thread[session] = nil
 			if co then
-				self.__result[co] = result_ok
-				self.__result_data[co] = result_data
-				skynet.wakeup(co)
+				if padding and result_ok then
+					-- If padding is true, append result_data to a table (self.__result_data[co])
+					local result = self.__result_data[co] or {}
+					self.__result_data[co] = result
+					table.insert(result, result_data)
+				else
+					self.__thread[session] = nil
+					self.__result[co] = result_ok
+					if result_ok and self.__result_data[co] then
+						table.insert(self.__result_data[co], result_data)
+					else
+						self.__result_data[co] = result_data
+					end
+					skynet.wakeup(co)
+				end
 			else
+				self.__thread[session] = nil
 				skynet.error("socket: unknown session :", session)
 			end
 		else
@@ -101,7 +116,14 @@ local function dispatch_by_session(self)
 end
 
 local function pop_response(self)
-	return table.remove(self.__request, 1), table.remove(self.__thread, 1)
+	while true do
+		local func,co = table.remove(self.__request, 1), table.remove(self.__thread, 1)
+		if func then
+			return func, co
+		end
+		self.__wait_response = coroutine.running()
+		skynet.wait(self.__wait_response)
+	end
 end
 
 local function push_response(self, response, co)
@@ -112,31 +134,43 @@ local function push_response(self, response, co)
 		-- response is a function, push it to __request
 		table.insert(self.__request, response)
 		table.insert(self.__thread, co)
+		if self.__wait_response then
+			skynet.wakeup(self.__wait_response)
+			self.__wait_response = nil
+		end
 	end
 end
 
 local function dispatch_by_order(self)
 	while self.__sock do
 		local func, co = pop_response(self)
-		if func == nil then
-			if not socket.block(self.__sock[1]) then
-				close_channel_socket(self)
-				wakeup_all(self)
+		local ok, result_ok, result_data, padding = pcall(func, self.__sock)
+		if ok then
+			if padding and result_ok then
+				-- if padding is true, wait for next result_data
+				-- self.__result_data[co] is a table
+				local result = self.__result_data[co] or {}
+				self.__result_data[co] = result
+				table.insert(result, result_data)
+			else
+				self.__result[co] = result_ok
+				if result_ok and self.__result_data[co] then
+					table.insert(self.__result_data[co], result_data)
+				else
+					self.__result_data[co] = result_data
+				end
+				skynet.wakeup(co)
 			end
 		else
-			local ok, result_ok, result_data = pcall(func, self.__sock)
-			if ok then
-				self.__result[co] = result_ok
-				self.__result_data[co] = result_data
-				skynet.wakeup(co)
-			else
-				close_channel_socket(self)
-				local errmsg
-				if result ~= socket_error then
-					errmsg = result_ok
-				end
-				wakeup_all(self, errmsg)
+			close_channel_socket(self)
+			local errmsg
+			if result_ok ~= socket_error then
+				errmsg = result_ok
 			end
+			self.__result[co] = socket_error
+			self.__result_data[co] = errmsg
+			skynet.wakeup(co)
+			wakeup_all(self, errmsg)
 		end
 	end
 end
@@ -149,42 +183,80 @@ local function dispatch_function(self)
 	end
 end
 
+local function connect_backup(self)
+	if self.__backup then
+		for _, addr in ipairs(self.__backup) do
+			local host, port
+			if type(addr) == "table" then
+				host, port = addr.host, addr.port
+			else
+				host = addr
+				port = self.__port
+			end
+			skynet.error("socket: connect to backup host", host, port)
+			local fd = socket.open(host, port)
+			if fd then
+				self.__host = host
+				self.__port = port
+				return fd
+			end
+		end
+	end
+end
+
 local function connect_once(self)
-	assert(not self.__sock and not self.__authcoroutine)
-	local fd = socket.open(self.__host, self.__port)
-	if not fd then
+	if self.__closed then
 		return false
 	end
-	self.__authcoroutine = coroutine.running()
+	assert(not self.__sock and not self.__authcoroutine)
+	local fd,err = socket.open(self.__host, self.__port)
+	if not fd then
+		fd = connect_backup(self)
+		if not fd then
+			return false, err
+		end
+	end
+	if self.__nodelay then
+		socketdriver.nodelay(fd)
+	end
+
 	self.__sock = setmetatable( {fd} , channel_socket_meta )
 	skynet.fork(dispatch_function(self), self)
 
 	if self.__auth then
+		self.__authcoroutine = coroutine.running()
 		local ok , message = pcall(self.__auth, self)
 		if not ok then
 			close_channel_socket(self)
 			if message ~= socket_error then
+				self.__authcoroutine = false
 				skynet.error("socket: auth failed", message)
 			end
 		end
 		self.__authcoroutine = false
+		if ok and not self.__sock then
+			-- auth may change host, so connect again
+			return connect_once(self)
+		end
 		return ok
 	end
 
-	self.__authcoroutine = false
 	return true
 end
 
 local function try_connect(self , once)
-	local t = 100
+	local t = 0
 	while not self.__closed do
-		if connect_once(self) then
+		local ok, err = connect_once(self)
+		if ok then
 			if not once then
 				skynet.error("socket: connect to", self.__host, self.__port)
 			end
 			return
 		elseif once then
-			error(string.format("Connect to %s:%d failed", self.__host, self.__port))
+			return err
+		else
+			skynet.error("socket: connect", err)
 		end
 		if t > 1000 then
 			skynet.error("socket: try to reconnect", self.__host, self.__port)
@@ -197,7 +269,7 @@ local function try_connect(self , once)
 	end
 end
 
-local function block_connect(self, once)
+local function check_connection(self)
 	if self.__sock then
 		local authco = self.__authcoroutine
 		if not authco then
@@ -211,26 +283,37 @@ local function block_connect(self, once)
 	if self.__closed then
 		return false
 	end
+end
+
+local function block_connect(self, once)
+	local r = check_connection(self)
+	if r ~= nil then
+		return r
+	end
+	local err
 
 	if #self.__connecting > 0 then
 		-- connecting in other coroutine
 		local co = coroutine.running()
 		table.insert(self.__connecting, co)
-		skynet.wait()
-		-- check connection again
-		return block_connect(self, once)
-	end
-	self.__connecting[1] = true
-	try_connect(self, once)
-	self.__connecting[1] = nil
-	for i=2, #self.__connecting do
-		local co = self.__connecting[i]
-		self.__connecting[i] = nil
-		skynet.wakeup(co)
+		skynet.wait(co)
+	else
+		self.__connecting[1] = true
+		err = try_connect(self, once)
+		self.__connecting[1] = nil
+		for i=2, #self.__connecting do
+			local co = self.__connecting[i]
+			self.__connecting[i] = nil
+			skynet.wakeup(co)
+		end
 	end
 
-	-- check again
-	return block_connect(self, once)
+	r = check_connection(self)
+	if r == nil then
+		error(string.format("Connect to %s:%d failed (%s)", self.__host, self.__port, err))
+	else
+		return r
+	end
 end
 
 function channel:connect(once)
@@ -244,7 +327,7 @@ end
 local function wait_for_response(self, response)
 	local co = coroutine.running()
 	push_response(self, response, co)
-	skynet.wait()
+	skynet.wait(co)
 
 	local result = self.__result[co]
 	self.__result[co] = nil
@@ -252,20 +335,38 @@ local function wait_for_response(self, response)
 	self.__result_data[co] = nil
 
 	if result == socket_error then
-		error(socket_error)
+		if result_data then
+			error(result_data)
+		else
+			error(socket_error)
+		end
 	else
 		assert(result, result_data)
 		return result_data
 	end
 end
 
-function channel:request(request, response)
-	assert(block_connect(self))
+local socket_write = socket.write
+local socket_lwrite = socket.lwrite
 
-	if not socket.write(self.__sock[1], request) then
-		close_channel_socket(self)
-		wakeup_all(self)
-		error(socket_error)
+function channel:request(request, response, padding)
+	assert(block_connect(self, true))	-- connect once
+	local fd = self.__sock[1]
+
+	if padding then
+		-- padding may be a table, to support multi part request
+		-- multi part request use low priority socket write
+		-- socket_lwrite returns nothing
+		socket_lwrite(fd , request)
+		for _,v in ipairs(padding) do
+			socket_lwrite(fd, v)
+		end
+	else
+		if not socket_write(fd , request) then
+			close_channel_socket(self)
+			wakeup_all(self)
+			error(socket_error)
+		end
 	end
 
 	if response == nil then
@@ -287,6 +388,20 @@ function channel:close()
 		self.__closed = true
 		close_channel_socket(self)
 	end
+end
+
+function channel:changehost(host, port)
+	self.__host = host
+	if port then
+		self.__port = port
+	end
+	if not self.__closed then
+		close_channel_socket(self)
+	end
+end
+
+function channel:changebackup(backup)
+	self.__backup = backup
 end
 
 channel_meta.__gc = channel.close
