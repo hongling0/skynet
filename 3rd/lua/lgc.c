@@ -192,17 +192,14 @@ void luaC_upvalbarrier_ (lua_State *L, UpVal *uv) {
 
 
 void luaC_fix (lua_State *L, GCObject *o) {
-  global_State *g = G(L);
-  if (o->tt == LUA_TSHRSTR) {
-    luaS_fix(g, gco2ts(o));
-    return;
+  if (!isshared(o)) {
+    global_State *g = G(L);
+    lua_assert(g->allgc == o);  /* object must be 1st in 'allgc' list! */
+    white2gray(o);  /* they will be gray forever */
+    g->allgc = o->next;  /* remove object from 'allgc' list */
+    o->next = g->fixedgc;  /* link it to 'fixedgc' list */
+    g->fixedgc = o;
   }
-  if (g->allgc != o)
-	  return;  /* if object is not 1st in 'allgc' list, it is in global short string table */
-  white2gray(o);  /* they will be gray forever */
-  g->allgc = o->next;  /* remove object from 'allgc' list */
-  o->next = g->fixedgc;  /* link it to 'fixedgc' list */
-  g->fixedgc = o;
 }
 
 
@@ -241,7 +238,11 @@ static void reallymarkobject (global_State *g, GCObject *o) {
  reentry:
   switch (o->tt) {
     case LUA_TSHRSTR: {
-      luaS_mark(g, gco2ts(o));
+      if (!isshared(o)) {
+        white2gray(o);
+        gray2black(o);
+      	g->GCmemtrav += sizelstring(gco2ts(o)->shrlen);
+	  }
       break;
     }
     case LUA_TLNGSTR: {
@@ -724,6 +725,10 @@ static void freeobj (lua_State *L, GCObject *o) {
     case LUA_TTABLE: luaH_free(L, gco2t(o)); break;
     case LUA_TTHREAD: luaE_freethread(L, gco2th(o)); break;
     case LUA_TUSERDATA: luaM_freemem(L, o, sizeudata(gco2u(o))); break;
+    case LUA_TSHRSTR:
+      luaS_remove(L, gco2ts(o));  /* remove it from hash table */
+      luaM_freemem(L, o, sizelstring(gco2ts(o)->shrlen));
+      break;
     case LUA_TLNGSTR: {
       luaM_freemem(L, o, sizelstring(gco2ts(o)->u.lnglen));
       break;
@@ -783,6 +788,19 @@ static GCObject **sweeptolive (lua_State *L, GCObject **p) {
 ** Finalization
 ** =======================================================
 */
+
+/*
+** If possible, shrink string table
+*/
+static void checkSizes (lua_State *L, global_State *g) {
+  if (g->gckind != KGC_EMERGENCY) {
+    l_mem olddebt = g->GCdebt;
+    if (g->strt.nuse < g->strt.size / 4)  /* string table too big? */
+      luaS_resize(L, g->strt.size / 2);  /* shrink it a little */
+    g->GCestimate += g->GCdebt - olddebt;  /* update estimate */
+  }
+}
+
 
 static GCObject *udata2finalize (global_State *g) {
   GCObject *o = g->tobefnz;  /* get first element */
@@ -974,6 +992,7 @@ void luaC_freeallobjects (lua_State *L) {
   sweepwholelist(L, &g->finobj);
   sweepwholelist(L, &g->allgc);
   sweepwholelist(L, &g->fixedgc);  /* collect fixed objects */
+  lua_assert(g->strt.nuse == 0);
 }
 
 
@@ -1019,7 +1038,6 @@ static l_mem atomic (lua_State *L) {
   clearvalues(g, g->allweak, origall);
   luaS_clearcache(g);
   g->currentwhite = cast_byte(otherwhite(g));  /* flip current white */
-  luaS_collect(g, 0);  /* send short strings set to gc thread */
   work += g->GCmemtrav;  /* complete counting */
   return work;  /* estimate of memory marked by 'atomic' */
 }
@@ -1045,7 +1063,7 @@ static lu_mem singlestep (lua_State *L) {
   global_State *g = G(L);
   switch (g->gcstate) {
     case GCSpause: {
-      g->GCmemtrav = 0;
+      g->GCmemtrav = g->strt.size * sizeof(GCObject*);
       restartcollection(g);
       g->gcstate = GCSpropagate;
       return g->GCmemtrav;
@@ -1077,6 +1095,7 @@ static lu_mem singlestep (lua_State *L) {
     }
     case GCSswpend: {  /* finish sweeps */
       makewhite(g, g->mainthread);  /* sweep main thread */
+      checkSizes(L, g);
       g->gcstate = GCScallfin;
       return 0;
     }

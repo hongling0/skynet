@@ -307,7 +307,7 @@ typedef struct TString {
   unsigned int hash;
   union {
     size_t lnglen;  /* length for long strings */
-    size_t ref;	/* reference count for short strings */
+    struct TString *hnext;  /* linked list for hash table */
   } u;
 } TString;
 

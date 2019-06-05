@@ -10,6 +10,7 @@
 #include "lgc.h"
 #include "lobject.h"
 #include "lstate.h"
+#include "lgc.h"
 
 
 #define sizelstring(l)  (sizeof(union UTString) + ((l) + 1) * sizeof(char))
@@ -30,44 +31,22 @@
 /*
 ** equality for short strings, which are always internalized
 */
-#define eqshrstr(a,b)	check_exp((a)->tt == LUA_TSHRSTR, (a) == (b))
+#define eqshrstr(a,b)	check_exp((a)->tt == LUA_TSHRSTR, (a) == (b)?1:\
+	((isshared(a)||isshared(b))?luaS_eqshrstr(a, b):0))
 
 
 LUAI_FUNC unsigned int luaS_hash (const char *str, size_t l, unsigned int seed);
 LUAI_FUNC unsigned int luaS_hashlongstr (TString *ts);
 LUAI_FUNC int luaS_eqlngstr (TString *a, TString *b);
+LUAI_FUNC int luaS_eqshrstr (TString *a, TString *b);
+LUAI_FUNC void luaS_resize (lua_State *L, int newsize);
 LUAI_FUNC void luaS_clearcache (global_State *g);
 LUAI_FUNC void luaS_init (lua_State *L);
+LUAI_FUNC void luaS_remove (lua_State *L, TString *ts);
 LUAI_FUNC Udata *luaS_newudata (lua_State *L, size_t s);
 LUAI_FUNC TString *luaS_newlstr (lua_State *L, const char *str, size_t l);
 LUAI_FUNC TString *luaS_new (lua_State *L, const char *str);
 LUAI_FUNC TString *luaS_createlngstrobj (lua_State *L, size_t l);
 
-#define ENABLE_SHORT_STRING_TABLE
-
-struct ssm_info {
-	int total;
-	int longest;
-	int slots;
-	int garbage;
-	size_t size;
-	size_t garbage_size;
-	double variance;
-};
-
-struct ssm_collect {
-	void *key;
-	int n;
-	int sweep;
-};
-
-LUA_API void luaS_initssm();
-LUA_API void luaS_exitssm();
-LUA_API void luaS_infossm(struct ssm_info *info);
-LUA_API int luaS_collectssm(struct ssm_collect *info);
-
-LUAI_FUNC void luaS_mark(global_State *g, TString *s);
-LUAI_FUNC void luaS_fix(global_State *g, TString *s);
-LUAI_FUNC void luaS_collect(global_State *g, int closed);
 
 #endif

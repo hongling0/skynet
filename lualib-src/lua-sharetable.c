@@ -11,8 +11,6 @@
 #include "lapi.h"
 #include "lgc.h"
 
-#ifdef ENABLE_SHORT_STRING_TABLE
-
 static void
 mark_shared(lua_State *L) {
 	if (lua_type(L, -1) != LUA_TTABLE) {
@@ -47,9 +45,7 @@ mark_shared(lua_State *L) {
 			case LUA_TSTRING: {
 				const char *str = lua_tostring(L, idx);
 				TString *ts = (TString *)(str - sizeof(UTString));
-				if(ts->tt==LUA_TLNGSTR)
-					makeshared(ts);
-				break;
+				makeshared(ts);
 			}
 			default:
 				luaL_error(L, "Invalid type [%s]", lua_typename(L, t));
@@ -223,12 +219,3 @@ luaopen_skynet_sharetable_core(lua_State *L) {
 	luaL_newlib(L, l);
 	return 1;
 }
-
-#else
-
-LUAMOD_API int
-luaopen_skynet_sharetable_core(lua_State *L) {
-	return luaL_error(L, "No share string table support");
-}
-
-#endif
